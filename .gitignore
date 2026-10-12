@@ -1,0 +1,6 @@
+node_modules/
+dist/
+test_data/
+garbage/
+/data/central_db.json
+/data/nodes/
