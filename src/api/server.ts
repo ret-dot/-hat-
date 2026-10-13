@@ -135,12 +135,15 @@ export function createServer(customDb?: CentralDatabase) {
     res.json({ status: 'UP', timestamp: new Date().toISOString() });
   });
 
+  app.get('/', (_req, res) => {
+    res.json({ status: 'UP', message: 'API server running. Start the website with npm run dev.' });
+  });
+
   // 1. Registrations (PRD 3.1 & TRD Section 2)
   app.post('/api/v1/registrations', (req, res) => {
     try {
       const actor = (req.headers['x-user-id'] as string) || 'public-user';
-      const { node_id: nodeId, ...payload } = req.body;
-      const record = service.submitRegistration(payload, actor, nodeId);
+      const record = service.submitRegistration(req.body, actor);
       res.status(201).json(record);
     } catch (e: any) {
       res.status(400).json({ code: 'ERR_101', message: e.message });
@@ -165,17 +168,10 @@ export function createServer(customDb?: CentralDatabase) {
     try {
       const actor = (req.headers['x-user-id'] as string) || 'admin';
       const result = service.approveRegistration(req.params.id, actor);
-      // Keep the local offline lease on the terminal assigned during registration.
+      // Also update in-memory edgeNodes map so offline mode immediately has local lease:
       const allocatedQuota = result.registration.data.family_count * 10;
-      const assignedEdge = result.registration.node_id
-        ? edgeNodes.get(result.registration.node_id)
-        : undefined;
-      if (assignedEdge) {
-        assignedEdge.allocateLocalLease(result.card.id, allocatedQuota);
-      } else if (!result.registration.node_id) {
-        for (const edge of edgeNodes.values()) {
-          edge.allocateLocalLease(result.card.id, allocatedQuota);
-        }
+      for (const edge of edgeNodes.values()) {
+        edge.allocateLocalLease(result.card.id, allocatedQuota);
       }
       res.status(200).json(result);
     } catch (e: any) {
@@ -184,20 +180,10 @@ export function createServer(customDb?: CentralDatabase) {
   });
 
   app.get('/api/v1/cards', (req, res) => {
-    const requestedNodeId = typeof req.query.node_id === 'string' ? req.query.node_id : undefined;
-    const defaultNodeId = db.listNodes()[0]?.id;
-    const registrations = db.listRegistrations();
-    const cards = db.listCards().filter((card) => {
-      if (!requestedNodeId) return true;
-      const registration = registrations.find((item) => item.card_id === card.id);
-      return (registration?.node_id || defaultNodeId) === requestedNodeId;
-    }).map((c) => {
+    const cards = db.listCards().map((c) => {
       const person = db.getPersonById(c.person_id);
       const household = db.getHouseholdByPersonId(c.person_id);
-      const registration = registrations.find((item) => item.card_id === c.id);
-      const ledger = registration?.node_id
-        ? db.getQuotaLedger(c.id, registration.node_id) || db.getQuotaLedger(c.id)
-        : db.getQuotaLedger(c.id) || (requestedNodeId ? db.getQuotaLedger(c.id, requestedNodeId) : undefined);
+      const ledger = db.getQuotaLedger(c.id);
       return {
         id: c.id,
         person_id: c.person_id,
@@ -448,20 +434,6 @@ export function createServer(customDb?: CentralDatabase) {
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
-  });
-
-  // Serve static UI if dist exists
-  const distPath = path.join(__dirname, '../../dist');
-  app.use(express.static(distPath));
-  app.use((req, res, next) => {
-    if (req.method === 'GET' && !req.path.startsWith('/api')) {
-      const indexPath = path.join(distPath, 'index.html');
-      if (!fs.existsSync(indexPath)) {
-        return res.status(503).send('Frontend build not found. Run `npm run build` or use `npm run dev`.');
-      }
-      return res.sendFile(indexPath);
-    }
-    next();
   });
 
   return { app, service, db, edgeNodes };
