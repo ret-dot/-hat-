@@ -2,6 +2,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CentralDatabase } from '../database/storage.js';
@@ -19,7 +20,14 @@ export function createServer(customDb?: CentralDatabase) {
   app.use(cors());
   app.use(express.json());
 
-  const dbPath = path.join(__dirname, '../../data/central_db.json');
+  const dataRoot = process.env.DATA_DIR || path.join(os.tmpdir(), 'ret-hat-data');
+  try {
+    fs.mkdirSync(dataRoot, { recursive: true });
+  } catch (error) {
+    console.error('Failed to ensure DATA_DIR exists:', error);
+  }
+
+  const dbPath = path.join(dataRoot, 'central_db.json');
   const db = customDb || new CentralDatabase(dbPath);
   const service = new CentralService(db);
 
@@ -46,7 +54,7 @@ export function createServer(customDb?: CentralDatabase) {
         nodeName: 'Distribution Node Alpha',
         privateKeyHex: keysA.privateKeyHex,
         publicKeyHex: keysA.publicKeyHex,
-        dataDir: path.join(__dirname, '../../data/nodes'),
+        dataDir: path.join(dataRoot, 'nodes'),
       });
       edgeNodes.set(nodeAId, edgeA);
 
@@ -67,7 +75,7 @@ export function createServer(customDb?: CentralDatabase) {
         nodeName: 'Distribution Node Beta',
         privateKeyHex: keysB.privateKeyHex,
         publicKeyHex: keysB.publicKeyHex,
-        dataDir: path.join(__dirname, '../../data/nodes'),
+        dataDir: path.join(dataRoot, 'nodes'),
       });
       edgeNodes.set(nodeBId, edgeB);
     } else {
@@ -80,7 +88,7 @@ export function createServer(customDb?: CentralDatabase) {
             nodeName: n.name,
             privateKeyHex: keys.privateKeyHex,
             publicKeyHex: n.public_key || keys.publicKeyHex,
-            dataDir: path.join(__dirname, '../../data/nodes'),
+            dataDir: path.join(dataRoot, 'nodes'),
           });
           edgeNodes.set(n.id, edge);
         }
@@ -419,7 +427,7 @@ export function createServer(customDb?: CentralDatabase) {
   app.post('/api/v1/admin/reset', async (req, res) => {
     try {
       db.clearAllData();
-      const nodeDir = path.join(__dirname, '../../data/nodes');
+      const nodeDir = path.join(dataRoot, 'nodes');
       if (fs.existsSync(nodeDir)) {
         const files = fs.readdirSync(nodeDir);
         for (const file of files) {
@@ -434,6 +442,11 @@ export function createServer(customDb?: CentralDatabase) {
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('Unhandled error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: err?.message || 'Internal Server Error' });
   });
 
   return { app, service, db, edgeNodes };
