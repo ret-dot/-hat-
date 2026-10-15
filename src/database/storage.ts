@@ -239,9 +239,12 @@ export class CentralDatabase {
     quantity: number
   ): { success: boolean; reason?: 'CARD_QUOTA_EXHAUSTED' | 'LOT_CAP_EXHAUSTED' | 'NOT_FOUND' } {
     // Acquire synchronous lock
-    while (this.lock) {
-      // In JS single-threaded event loop, synchronous block will not interleave,
-      // but this guarantees safety for async tasks
+    // NOTE: previous implementation busy-waited on this.lock which could block the event loop.
+    // Avoid busy-waiting; simply acquire the lock if available. This is acceptable for the demo in a single-process
+    // environment. For production, use a proper DB transaction.
+    if (this.lock) {
+      // Cannot acquire lock immediately; treat as temporary not-found to avoid blocking.
+      return { success: false, reason: 'NOT_FOUND' };
     }
     this.lock = true;
     try {
