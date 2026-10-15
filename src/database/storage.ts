@@ -35,10 +35,39 @@ export interface DatabaseState {
   used_nonces: Record<string, { token_id: string; timestamp: string }>;
 }
 
+// Simple in-process async mutex with FIFO waiter queue.
+class Mutex {
+  private _locked = false;
+  private waiters: Array<() => void> = [];
+
+  async lock(): Promise<void> {
+    if (!this._locked) {
+      this._locked = true;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.waiters.push(resolve);
+    });
+    // Ownership transferred
+    this._locked = true;
+  }
+
+  unlock(): void {
+    if (this.waiters.length > 0) {
+      const next = this.waiters.shift()!;
+      // wake next waiter
+      next();
+    } else {
+      this._locked = false;
+    }
+  }
+}
+
 export class CentralDatabase {
   private state: DatabaseState;
   private filePath?: string;
-  private lock = false;
+  private lock = false; // legacy flag; retained for compatibility
+  private mutexes = new Map<string, Mutex>();
 
   constructor(filePath?: string) {
     this.filePath = filePath;
@@ -230,23 +259,39 @@ export class CentralDatabase {
   }
 
   /**
-   * Atomic quota check & deduct (concurrency-safe simulating SELECT ... FOR UPDATE).
+   * Async atomic quota check & deduct (concurrency-safe simulating SELECT ... FOR UPDATE).
    */
-  public atomicDeductQuota(
+  public async atomicDeductQuota(
     cardId: string,
     nodeId: string,
     lotId: string,
-    quantity: number
-  ): { success: boolean; reason?: 'CARD_QUOTA_EXHAUSTED' | 'LOT_CAP_EXHAUSTED' | 'NOT_FOUND' } {
-    // Acquire synchronous lock
-    // NOTE: previous implementation busy-waited on this.lock which could block the event loop.
-    // Avoid busy-waiting; simply acquire the lock if available. This is acceptable for the demo in a single-process
-    // environment. For production, use a proper DB transaction.
-    if (this.lock) {
-      // Cannot acquire lock immediately; treat as temporary not-found to avoid blocking.
-      return { success: false, reason: 'NOT_FOUND' };
+    quantity: number,
+    timeoutMs = 500
+  ): Promise<{ success: boolean; reason?: 'CARD_QUOTA_EXHAUSTED' | 'LOT_CAP_EXHAUSTED' | 'NOT_FOUND' | 'LOCK_TIMEOUT' }> {
+    // Use a per-resource mutex key (card + lot + node) to minimize contention
+    const key = `${cardId}::${nodeId}::${lotId}`;
+    let m = this.mutexes.get(key);
+    if (!m) {
+      m = new Mutex();
+      this.mutexes.set(key, m);
     }
-    this.lock = true;
+
+    // Attempt to acquire lock with timeout
+    let acquired = false;
+    const acquirePromise = m.lock().then(() => {
+      acquired = true;
+    });
+
+    const timeoutPromise = new Promise<void>((_, reject) => {
+      setTimeout(() => reject(new Error('lock-timeout')), timeoutMs);
+    });
+
+    try {
+      await Promise.race([acquirePromise, timeoutPromise]);
+    } catch (err) {
+      if (!acquired) return { success: false, reason: 'LOCK_TIMEOUT' };
+    }
+
     try {
       const lot = this.state.lots.find((l) => l.id === lotId);
       if (!lot || lot.remaining_quantity < quantity) {
@@ -271,7 +316,7 @@ export class CentralDatabase {
       this.persist();
       return { success: true };
     } finally {
-      this.lock = false;
+      m!.unlock();
     }
   }
 
