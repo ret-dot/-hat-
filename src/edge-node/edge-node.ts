@@ -52,17 +52,31 @@ export class EdgeDistributionNode {
   }
 
   private loadState(): EdgeNodeState {
-    if (!fs.existsSync(this.config.dataDir)) {
-      fs.mkdirSync(this.config.dataDir, { recursive: true });
-    }
-    if (fs.existsSync(this.stateFile)) {
-      try {
-        const raw = fs.readFileSync(this.stateFile, 'utf-8');
-        return JSON.parse(raw);
-      } catch {
-        // start clean if corrupt
+    try {
+      if (!fs.existsSync(this.config.dataDir)) {
+        try {
+          fs.mkdirSync(this.config.dataDir, { recursive: true });
+        } catch (e) {
+          console.error(`Could not create dataDir ${this.config.dataDir}:`, e);
+        }
       }
+    } catch (e) {
+      console.error('Error checking/creating dataDir:', e);
     }
+
+    try {
+      if (fs.existsSync(this.stateFile)) {
+        try {
+          const raw = fs.readFileSync(this.stateFile, 'utf-8');
+          return JSON.parse(raw);
+        } catch (e) {
+          console.error(`Failed to read/parse state file ${this.stateFile}:`, e);
+        }
+      }
+    } catch (e) {
+      console.error('Error checking/reading stateFile:', e);
+    }
+
     return {
       counter: 1000,
       localQuotas: {},
