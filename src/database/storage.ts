@@ -230,7 +230,9 @@ export class CentralDatabase {
   }
 
   /**
-   * Atomic quota check & deduct (concurrency-safe simulating SELECT ... FOR UPDATE).
+   * Atomic quota check & deduct.
+   * Avoid the synchronous busy-wait lock because it can stall the Node.js event loop
+   * and trigger spurious internal-server errors or request hangs under load.
    */
   public atomicDeductQuota(
     cardId: string,
@@ -238,11 +240,11 @@ export class CentralDatabase {
     lotId: string,
     quantity: number
   ): { success: boolean; reason?: 'CARD_QUOTA_EXHAUSTED' | 'LOT_CAP_EXHAUSTED' | 'NOT_FOUND' } {
-    // Acquire synchronous lock
-    while (this.lock) {
-      // In JS single-threaded event loop, synchronous block will not interleave,
-      // but this guarantees safety for async tasks
+    if (this.lock) {
+      // Fail fast instead of spinning forever in the event loop.
+      return { success: false, reason: 'NOT_FOUND' };
     }
+
     this.lock = true;
     try {
       const lot = this.state.lots.find((l) => l.id === lotId);
@@ -262,7 +264,6 @@ export class CentralDatabase {
         return { success: false, reason: 'CARD_QUOTA_EXHAUSTED' };
       }
 
-      // Perform deduction atomically
       lot.remaining_quantity -= quantity;
       ledger.consumed_qty += quantity;
       this.persist();
