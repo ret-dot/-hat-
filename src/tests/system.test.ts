@@ -7,13 +7,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CentralDatabase } from '../database/storage.js';
+import { SupabaseStateStore } from '../database/supabase-state.js';
 import { CentralService } from '../services/central-service.js';
 import { EdgeDistributionNode } from '../edge-node/edge-node.js';
 import { generateUuidV7, isValidUuidV7 } from '../core/uuidv7.js';
 import { generateNodeKeyPair, signTokenPayload, verifyTokenPayload } from '../core/crypto.js';
 import { validateTransition, InvalidStateTransitionError } from '../core/state-machine.js';
 import type { SignedProvisionalToken } from '../core/types.js';
-import { createAccessToken, createAuthMiddleware, createLocalDemoLogin, requireRoles } from '../api/auth.js';
+import {
+  createAccessToken,
+  createAuthMiddleware,
+  createLocalDemoLogin,
+  createSupabaseAuthMiddleware,
+  requireRoles,
+} from '../api/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,7 +28,7 @@ const __dirname = path.dirname(__filename);
 async function runAllTests() {
   console.log('====================================================');
   console.log('STARTING GRAIN DISTRIBUTION COMPREHENSIVE TEST SUITE');
-  console.log('Testing 22 Critical Scenarios from test-plan.md & TRD');
+  console.log('Testing 24 Critical Scenarios from test-plan.md & TRD');
   console.log('====================================================\n');
 
   const testDataDir = path.join(__dirname, '../../test_data');
@@ -725,6 +732,100 @@ async function runAllTests() {
     } finally {
       server.close();
       await once(server, 'close');
+    }
+  });
+
+  await test('23. Supabase auth: API trusts verified app metadata role only', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!url.startsWith('https://supabase.test/auth/v1/user')) {
+        return originalFetch(input, init);
+      }
+
+      const authorization = new Headers(init?.headers).get('authorization');
+      if (authorization === 'Bearer invalid-token') {
+        return new Response(JSON.stringify({ message: 'Invalid token' }), { status: 401 });
+      }
+      const role = authorization === 'Bearer no-role-token' ? undefined : 'DISTRIBUTION_OPERATOR';
+      return new Response(JSON.stringify({
+        id: 'verified-user-id',
+        app_metadata: role ? { role } : {},
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const authApp = express();
+    authApp.use('/api/v1', createSupabaseAuthMiddleware('https://supabase.test', 'test-publishable-key'));
+    authApp.get('/api/v1/protected', requireRoles('DISTRIBUTION_OPERATOR'), (req, res) => {
+      res.json({ sub: req.auth?.sub, role: req.auth?.role });
+    });
+    const server = authApp.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const url = `http://127.0.0.1:${address.port}/api/v1/protected`;
+      const invalid = await fetch(url, { headers: { authorization: 'Bearer invalid-token' } });
+      assert.strictEqual(invalid.status, 401);
+      const noRole = await fetch(url, { headers: { authorization: 'Bearer no-role-token' } });
+      assert.strictEqual(noRole.status, 403);
+      const authorized = await fetch(url, { headers: { authorization: 'Bearer valid-token' } });
+      assert.strictEqual(authorized.status, 200);
+      assert.deepStrictEqual(await authorized.json(), {
+        sub: 'verified-user-id',
+        role: 'DISTRIBUTION_OPERATOR',
+      });
+    } finally {
+      server.close();
+      await once(server, 'close');
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  await test('24. Supabase state store: loads snapshots and uses revision-checked writes', async () => {
+    const originalFetch = globalThis.fetch;
+    const initialState = new CentralDatabase().createSnapshot();
+    let saveRequest: Record<string, unknown> | undefined;
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!url.startsWith('https://supabase.test/rest/v1/')) return originalFetch(input, init);
+      if (url.includes('/application_state?')) {
+        return new Response(JSON.stringify({ state: initialState, revision: 3 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/rpc/save_application_state')) {
+        saveRequest = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response('4', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('Not found', { status: 404 });
+    };
+
+    try {
+      const store = new SupabaseStateStore('https://supabase.test', 'test-service-role-key');
+      const snapshot = await store.load();
+      assert.strictEqual(snapshot.revision, 3);
+      assert.deepStrictEqual(snapshot.state, initialState);
+
+      const nextState = {
+        ...initialState,
+        persons: [{
+          id: 'person-1',
+          first_name: 'Test',
+          last_name: 'Person',
+          phone_number: '+911234567890',
+          dob: '2000-01-01',
+          created_at: '2026-10-16T00:00:00.000Z',
+        }],
+      };
+      const revision = await store.save(nextState, snapshot.revision);
+      assert.strictEqual(revision, 4);
+      assert.strictEqual(saveRequest?.expected_revision, 3);
+      assert.deepStrictEqual(saveRequest?.next_state, nextState);
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 

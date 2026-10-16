@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { Request, RequestHandler, Response } from 'express';
+import { createClient } from '@supabase/supabase-js';
 import type { UserRole } from '../core/types.js';
 
 export interface AuthIdentity {
@@ -141,6 +142,40 @@ export function createLocalDemoLogin(secret: string): RequestHandler {
       token_type: 'Bearer',
       expires_in: 3600,
     });
+  };
+}
+
+export function createSupabaseAuthMiddleware(url: string, anonKey: string): RequestHandler {
+  const supabase = createClient(url, anonKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  return async (req, res, next) => {
+    const authorization = req.headers.authorization;
+    const match = typeof authorization === 'string' ? /^Bearer (.+)$/.exec(authorization) : null;
+    if (!match || match[1].length > 8192) {
+      return res.status(401).json({ code: 'ERR_AUTH_REQUIRED', message: 'A valid Supabase access token is required' });
+    }
+
+    const { data, error } = await supabase.auth.getUser(match[1]);
+    if (error && (error.status === 401 || error.status === 403)) {
+      return res.status(401).json({ code: 'ERR_AUTH_INVALID', message: 'Supabase access token is invalid or expired' });
+    }
+    if (error) {
+      console.error('Supabase access token verification failed:', error);
+      return res.status(503).json({ code: 'ERR_AUTH_UNAVAILABLE', message: 'Authentication service is temporarily unavailable' });
+    }
+    if (!data.user) {
+      return res.status(401).json({ code: 'ERR_AUTH_INVALID', message: 'Supabase access token is invalid or expired' });
+    }
+
+    const role = data.user.app_metadata.role;
+    if (!isUserRole(role)) {
+      return res.status(403).json({ code: 'ERR_FORBIDDEN', message: 'This account has no authorized application role' });
+    }
+
+    req.auth = { sub: data.user.id, role };
+    return next();
   };
 }
 

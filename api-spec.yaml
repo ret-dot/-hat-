@@ -1,8 +1,8 @@
 <!-- file: api-spec.yaml -->
-# Protected API routes require an HS256 JWT in Authorization: Bearer <token>.
-# Configure AUTH_TOKEN_SECRET with at least 32 private bytes in production. Without it, local
-# non-production runs provide POST /api/v1/auth/demo, restricted to localhost, with a one-hour
-# administrator token. Tokens contain sub, role, aud: "grain-api", iat, and exp. Role headers are ignored.
+# Production protected routes require a verified Supabase access token whose app_metadata contains
+# an authorized role. Configure Supabase using the environment variables documented in docs/.
+# Local non-production runs provide POST /api/v1/auth/demo, restricted to localhost, with a
+# one-hour administrator token when Supabase is not configured. Role headers are ignored.
 # POST /api/v1/registrations is the only unauthenticated API route and returns only its record ID/status.
 openapi: 3.0.0
 info:
