@@ -226,17 +226,20 @@ export class CentralService {
       };
     }
 
-    // Supervisors, Admins, Auditors
-    return {
-      id: person.id,
-      first_name: person.first_name,
-      last_name: person.last_name,
-      phone_number: person.phone_number,
-      dob: person.dob,
-      household,
-      card,
-      quota_ledger: ledger,
-    };
+    if (callerRole === 'SUPERVISOR' || callerRole === 'ADMINISTRATOR' || callerRole === 'AUDITOR') {
+      return {
+        id: person.id,
+        first_name: person.first_name,
+        last_name: person.last_name,
+        phone_number: person.phone_number,
+        dob: person.dob,
+        household,
+        card,
+        quota_ledger: ledger,
+      };
+    }
+
+    throw new Error('Insufficient role to access person records');
   }
 
   public autofillTemplate(personId: string, templateType: 'DISTRIBUTION_RECEIPT' | 'APPLICATION_FORM', callerRole: UserRole, callerId: string): Record<string, unknown> {

@@ -26,7 +26,7 @@ import {
   Check,
   XCircle,
 } from 'lucide-react';
-import type { UserRole, TxnState, ReasonCode } from '../core/types.js';
+import type { TxnState, ReasonCode } from '../core/types.js';
 
 interface CardBeneficiary {
   id: string;
@@ -185,7 +185,8 @@ export default function App(): React.ReactElement {
   const [activeTab, setActiveTab] = useState<
     'distribution' | 'registrations' | 'edge-sync' | 'inventory' | 'audit-trail'
   >('distribution');
-  const [activeRole, setActiveRole] = useState<UserRole>('DISTRIBUTION_OPERATOR');
+  const [accessToken, setAccessToken] = useState('');
+  const [authStatus, setAuthStatus] = useState<'disconnected' | 'connected' | 'unavailable'>('disconnected');
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [selectedNodeId, setSelectedNodeId] = useState<string>('node-alpha-001');
   const selectedNodeIdRef = useRef(selectedNodeId);
@@ -236,15 +237,25 @@ export default function App(): React.ReactElement {
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
 
   // Load all data from API and synchronize
-  const loadAllData = async (preferredCardId?: string, nodeId = selectedNodeIdRef.current) => {
+  const apiFetch = (input: RequestInfo | URL, init: RequestInit = {}, token = accessToken) => {
+    const headers = new Headers(init.headers);
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    return fetch(input, { ...init, headers });
+  };
+
+  const loadAllData = async (
+    preferredCardId?: string,
+    nodeId = selectedNodeIdRef.current,
+    token = accessToken
+  ) => {
     try {
       const [cardsRes, lotsRes, nodesRes, regsRes, auditRes, metricsRes] = await Promise.all([
-        fetch(`/api/v1/cards?node_id=${encodeURIComponent(nodeId)}`).then((r) => r.json()).catch(() => []),
-        fetch('/api/v1/lots').then((r) => r.json()).catch(() => []),
-        fetch('/api/v1/nodes').then((r) => r.json()).catch(() => []),
-        fetch('/api/v1/registrations').then((r) => r.json()).catch(() => []),
-        fetch('/api/v1/audit').then((r) => r.json()).catch(() => []),
-        fetch('/api/v1/metrics').then((r) => r.json()).catch(() => null),
+        apiFetch(`/api/v1/cards?node_id=${encodeURIComponent(nodeId)}`, {}, token).then((r) => r.json()).catch(() => []),
+        apiFetch('/api/v1/lots', {}, token).then((r) => r.json()).catch(() => []),
+        apiFetch('/api/v1/nodes', {}, token).then((r) => r.json()).catch(() => []),
+        apiFetch('/api/v1/registrations', {}, token).then((r) => r.json()).catch(() => []),
+        apiFetch('/api/v1/audit', {}, token).then((r) => r.json()).catch(() => []),
+        apiFetch('/api/v1/metrics', {}, token).then((r) => r.json()).catch(() => null),
       ]);
 
       if (nodeId === selectedNodeIdRef.current && Array.isArray(cardsRes)) {
@@ -289,7 +300,23 @@ export default function App(): React.ReactElement {
     loadAllData(undefined, selectedNodeId);
     const interval = setInterval(() => loadAllData(undefined, selectedNodeId), 5000);
     return () => clearInterval(interval);
-  }, [selectedNodeId]);
+  }, [selectedNodeId, accessToken]);
+
+  const connectLocalDemo = async () => {
+    try {
+      const res = await fetch('/api/v1/auth/demo', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok || typeof data.access_token !== 'string') {
+        throw new Error(data.message || 'Local demo login is unavailable');
+      }
+      setAccessToken(data.access_token);
+      setAuthStatus('connected');
+      await loadAllData(undefined, undefined, data.access_token);
+    } catch (error) {
+      setAuthStatus('unavailable');
+      console.error('Local demo login failed:', error);
+    }
+  };
 
   // Active selected beneficiary card
   const activeBeneficiary = cards.find((c) => c.id === selectedCardId) || cards[0];
@@ -312,7 +339,7 @@ export default function App(): React.ReactElement {
   // Toggle Online/Offline
   const handleToggleOnline = async () => {
     try {
-      const res = await fetch(`/api/v1/edge-nodes/${selectedNodeId}/toggle-online`, { method: 'POST' });
+      const res = await apiFetch(`/api/v1/edge-nodes/${selectedNodeId}/toggle-online`, { method: 'POST' });
       const data = await res.json();
       setIsOnline(data.isOnline);
       loadAllData();
@@ -328,9 +355,9 @@ export default function App(): React.ReactElement {
     setRegFeedback(null);
 
     try {
-      const res = await fetch('/api/v1/registrations', {
+      const res = await apiFetch('/api/v1/registrations', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-user-id': 'operator-desk' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...regForm, node_id: selectedNodeId }),
       });
       const data = await res.json();
@@ -375,15 +402,13 @@ export default function App(): React.ReactElement {
   const handleApproveRegistration = async (regId: string) => {
     try {
       // 1. Verify if not already verified
-      await fetch(`/api/v1/registrations/${regId}/verify`, {
+      await apiFetch(`/api/v1/registrations/${regId}/verify`, {
         method: 'POST',
-        headers: { 'x-user-id': 'verifier-01' },
       });
 
       // 2. Approve
-      const res = await fetch(`/api/v1/registrations/${regId}/approve`, {
+      const res = await apiFetch(`/api/v1/registrations/${regId}/approve`, {
         method: 'POST',
-        headers: { 'x-user-id': 'supervisor-01' },
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Approval failed');
@@ -421,12 +446,11 @@ export default function App(): React.ReactElement {
     try {
       if (isOnline) {
         // Online Central Transaction
-        const res = await fetch('/api/v1/transactions', {
+        const res = await apiFetch('/api/v1/transactions', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'idempotency-key': `online_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
-            'x-user-id': 'staff-distributor',
           },
           body: JSON.stringify({
             card_id: selectedCardId,
@@ -462,7 +486,7 @@ export default function App(): React.ReactElement {
         }
       } else {
         // Offline Edge Node Issuance (Ed25519 Token)
-        const res = await fetch(`/api/v1/edge-nodes/${selectedNodeId}/issue`, {
+        const res = await apiFetch(`/api/v1/edge-nodes/${selectedNodeId}/issue`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -528,7 +552,7 @@ export default function App(): React.ReactElement {
     setSyncLoading(true);
     setSyncNotice(null);
     try {
-      const res = await fetch(`/api/v1/edge-nodes/${selectedNodeId}/sync-now`, { method: 'POST' });
+      const res = await apiFetch(`/api/v1/edge-nodes/${selectedNodeId}/sync-now`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Sync failed');
       setSyncNotice(
@@ -547,7 +571,7 @@ export default function App(): React.ReactElement {
       return;
     }
     try {
-      const res = await fetch('/api/v1/admin/reset', { method: 'POST' });
+      const res = await apiFetch('/api/v1/admin/reset', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Reset failed');
       setSelectedCardId('');
@@ -600,16 +624,21 @@ export default function App(): React.ReactElement {
             <span>{isOnline ? 'Network: Online' : 'Network: Offline (Edge)'}</span>
           </button>
 
-          {/* Role Switcher */}
-          <div className="role-selector">
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Role:</span>
-            <select value={activeRole} onChange={(e) => setActiveRole(e.target.value as UserRole)}>
-              <option value="DISTRIBUTION_OPERATOR">Distribution Operator</option>
-              <option value="REGISTRATION_OPERATOR">Registration Operator</option>
-              <option value="SUPERVISOR">Field Supervisor</option>
-              <option value="AUDITOR">Auditor</option>
-              <option value="ADMINISTRATOR">Administrator</option>
-            </select>
+          <div className="role-selector" style={{ gap: '0.4rem' }}>
+            <button
+              type="button"
+              className="btn-secondary"
+              style={{ fontSize: '0.75rem', padding: '0.35rem 0.65rem' }}
+              onClick={connectLocalDemo}
+              title="Local-only demo administrator access; expires after one hour"
+            >
+              {authStatus === 'connected' ? 'Local Demo Connected' : 'Connect Local Demo'}
+            </button>
+            {authStatus === 'unavailable' && (
+              <span role="status" style={{ color: 'var(--rose-400)', fontSize: '0.7rem' }}>
+                Demo login unavailable
+              </span>
+            )}
           </div>
 
           {/* Reset Database Button */}

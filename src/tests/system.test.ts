@@ -1,5 +1,8 @@
 // src/tests/system.test.ts
 import assert from 'node:assert';
+import { createHmac } from 'node:crypto';
+import { once } from 'node:events';
+import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +13,7 @@ import { generateUuidV7, isValidUuidV7 } from '../core/uuidv7.js';
 import { generateNodeKeyPair, signTokenPayload, verifyTokenPayload } from '../core/crypto.js';
 import { validateTransition, InvalidStateTransitionError } from '../core/state-machine.js';
 import type { SignedProvisionalToken } from '../core/types.js';
+import { createAccessToken, createAuthMiddleware, createLocalDemoLogin, requireRoles } from '../api/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,7 +21,7 @@ const __dirname = path.dirname(__filename);
 async function runAllTests() {
   console.log('====================================================');
   console.log('STARTING GRAIN DISTRIBUTION COMPREHENSIVE TEST SUITE');
-  console.log('Testing 20 Critical Scenarios from test-plan.md & TRD');
+  console.log('Testing 22 Critical Scenarios from test-plan.md & TRD');
   console.log('====================================================\n');
 
   const testDataDir = path.join(__dirname, '../../test_data');
@@ -637,6 +641,91 @@ async function runAllTests() {
 
     assert.strictEqual(res.state, 'PROVISIONAL_ISSUE');
     assert.strictEqual(res.transaction.fallback_reason, 'Authorized secondary supervisor offline override');
+  });
+
+  await test('21. API auth: missing and forged identity headers cannot access protected routes', async () => {
+    const secret = 'test-auth-secret-that-is-at-least-32-bytes';
+    const authApp = express();
+    authApp.use('/api/v1', createAuthMiddleware(secret));
+    authApp.get('/api/v1/admin/quotas', requireRoles('ADMINISTRATOR'), (_req, res) => {
+      res.json({ ok: true });
+    });
+    const server = authApp.listen(0);
+    await once(server, 'listening');
+
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const url = `http://127.0.0.1:${address.port}/api/v1/admin/quotas`;
+      const unauthenticated = await fetch(url, {
+        headers: { 'x-user-role': 'ADMINISTRATOR', 'x-user-id': 'attacker' },
+      });
+      assert.strictEqual(unauthenticated.status, 401);
+
+      const now = Math.floor(Date.now() / 1000);
+      const makeToken = (role: string) => {
+        const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+        const header = encode({ alg: 'HS256', typ: 'JWT' });
+        const payload = encode({ sub: 'test-user', role, aud: 'grain-api', iat: now, exp: now + 300 });
+        const signature = createHmac('sha256', secret).update(`${header}.${payload}`).digest('base64url');
+        return `${header}.${payload}.${signature}`;
+      };
+
+      const forbidden = await fetch(url, {
+        headers: {
+          authorization: `Bearer ${makeToken('BENEFICIARY')}`,
+          'x-user-role': 'ADMINISTRATOR',
+        },
+      });
+      assert.strictEqual(forbidden.status, 403);
+
+      const allowed = await fetch(url, {
+        headers: { authorization: `Bearer ${makeToken('ADMINISTRATOR')}` },
+      });
+      assert.strictEqual(allowed.status, 200);
+      assert.deepStrictEqual(await allowed.json(), { ok: true });
+    } finally {
+      server.close();
+      await once(server, 'close');
+    }
+  });
+
+  await test('22. Local demo login: localhost receives a signed administrator token', async () => {
+    const secret = 'local-demo-test-secret-at-least-32-bytes';
+    const demoApp = express();
+    demoApp.use(express.json());
+    demoApp.post('/api/v1/auth/demo', createLocalDemoLogin(secret));
+    demoApp.use('/api/v1', createAuthMiddleware(secret));
+    demoApp.get('/api/v1/admin/quotas', requireRoles('ADMINISTRATOR'), (_req, res) => {
+      res.json({ ok: true });
+    });
+    const server = demoApp.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+
+    try {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+      const login = await fetch(`${baseUrl}/api/v1/auth/demo`, {
+        method: 'POST',
+        headers: { origin: 'http://localhost:3000' },
+      });
+      assert.strictEqual(login.status, 200);
+      const loginData = await login.json() as { access_token: string };
+      const protectedResponse = await fetch(`${baseUrl}/api/v1/admin/quotas`, {
+        headers: { authorization: `Bearer ${loginData.access_token}` },
+      });
+      assert.strictEqual(protectedResponse.status, 200);
+
+      const remoteOrigin = await fetch(`${baseUrl}/api/v1/auth/demo`, {
+        method: 'POST',
+        headers: { origin: 'http://192.168.1.10:3000' },
+      });
+      assert.strictEqual(remoteOrigin.status, 403);
+    } finally {
+      server.close();
+      await once(server, 'close');
+    }
   });
 
   console.log('\n====================================================');

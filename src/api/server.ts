@@ -1,23 +1,27 @@
 // src/api/server.ts
-import express, { Request, Response, NextFunction } from 'express';
+import express, { Request } from 'express';
 import cors from 'cors';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { CentralDatabase } from '../database/storage.js';
 import { CentralService } from '../services/central-service.js';
 import { EdgeDistributionNode } from '../edge-node/edge-node.js';
 import { generateNodeKeyPair } from '../core/crypto.js';
 import { generateUuidV7 } from '../core/uuidv7.js';
-import type { UserRole, SyncBatchRequest } from '../core/types.js';
+import type { SyncBatchRequest } from '../core/types.js';
+import { createAuthMiddleware, createLocalDemoLogin, requireRoles } from './auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export function createServer(customDb?: CentralDatabase) {
+export function createServer(customDb?: CentralDatabase, authSecret = process.env.AUTH_TOKEN_SECRET) {
   const app = express();
   app.use(cors());
   app.use(express.json());
+  const localDemoAuth = !authSecret && process.env.NODE_ENV !== 'production';
+  const effectiveAuthSecret = authSecret || (localDemoAuth ? randomBytes(32).toString('base64url') : undefined);
 
   const dbPath = path.join(__dirname, '../../data/central_db.json');
   const db = customDb || new CentralDatabase(dbPath);
@@ -139,24 +143,29 @@ export function createServer(customDb?: CentralDatabase) {
     res.json({ status: 'UP', message: 'API server running. Start the website with npm run dev.' });
   });
 
+  if (localDemoAuth) {
+    app.post('/api/v1/auth/demo', createLocalDemoLogin(effectiveAuthSecret!));
+  }
+
   // 1. Registrations (PRD 3.1 & TRD Section 2)
   app.post('/api/v1/registrations', (req, res) => {
     try {
-      const actor = (req.headers['x-user-id'] as string) || 'public-user';
-      const record = service.submitRegistration(req.body, actor);
-      res.status(201).json(record);
+      const record = service.submitRegistration(req.body, 'public-registration');
+      res.status(201).json({ id: record.id, status: record.status, created_at: record.created_at });
     } catch (e: any) {
       res.status(400).json({ code: 'ERR_101', message: e.message });
     }
   });
 
-  app.get('/api/v1/registrations', (req, res) => {
+  app.use('/api/v1', createAuthMiddleware(effectiveAuthSecret));
+
+  app.get('/api/v1/registrations', requireRoles('REGISTRATION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR', 'AUDITOR'), (req, res) => {
     res.json(db.listRegistrations());
   });
 
-  app.post('/api/v1/registrations/:id/verify', (req, res) => {
+  app.post('/api/v1/registrations/:id/verify', requireRoles('REGISTRATION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR'), (req: Request<{ id: string }>, res) => {
     try {
-      const actor = (req.headers['x-user-id'] as string) || 'operator';
+      const actor = req.auth!.sub;
       const record = service.verifyRegistration(req.params.id, actor);
       res.json(record);
     } catch (e: any) {
@@ -164,9 +173,9 @@ export function createServer(customDb?: CentralDatabase) {
     }
   });
 
-  app.post('/api/v1/registrations/:id/approve', (req, res) => {
+  app.post('/api/v1/registrations/:id/approve', requireRoles('SUPERVISOR', 'ADMINISTRATOR'), (req: Request<{ id: string }>, res) => {
     try {
-      const actor = (req.headers['x-user-id'] as string) || 'admin';
+      const actor = req.auth!.sub;
       const result = service.approveRegistration(req.params.id, actor);
       // Also update in-memory edgeNodes map so offline mode immediately has local lease:
       const allocatedQuota = result.registration.data.family_count * 10;
@@ -179,7 +188,7 @@ export function createServer(customDb?: CentralDatabase) {
     }
   });
 
-  app.get('/api/v1/cards', (req, res) => {
+  app.get('/api/v1/cards', requireRoles('DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR'), (req, res) => {
     const cards = db.listCards().map((c) => {
       const person = db.getPersonById(c.person_id);
       const household = db.getHouseholdByPersonId(c.person_id);
@@ -206,10 +215,13 @@ export function createServer(customDb?: CentralDatabase) {
   });
 
   // 2. Beneficiary Lookup & Autofill (PRD 3.3, TRD Section 2)
-  app.get('/api/v1/persons/:id', (req, res) => {
+  app.get('/api/v1/persons/:id', requireRoles('BENEFICIARY', 'REGISTRATION_OPERATOR', 'DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR', 'AUDITOR'), (req: Request<{ id: string }>, res) => {
     try {
-      const role = ((req.headers['x-user-role'] as string) || 'DISTRIBUTION_OPERATOR') as UserRole;
-      const actor = (req.headers['x-user-id'] as string) || 'staff-user';
+      const { role } = req.auth!;
+      if (role === 'BENEFICIARY' && req.params.id !== req.auth!.sub) {
+        return res.status(403).json({ code: 'ERR_FORBIDDEN', message: 'Beneficiaries may only access their own record' });
+      }
+      const actor = req.auth!.sub;
       const data = service.lookupPerson(req.params.id, role, actor);
       res.json(data);
     } catch (e: any) {
@@ -217,10 +229,13 @@ export function createServer(customDb?: CentralDatabase) {
     }
   });
 
-  app.post('/api/v1/persons/:id/autofill', (req, res) => {
+  app.post('/api/v1/persons/:id/autofill', requireRoles('BENEFICIARY', 'REGISTRATION_OPERATOR', 'DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR', 'AUDITOR'), (req: Request<{ id: string }>, res) => {
     try {
-      const role = ((req.headers['x-user-role'] as string) || 'DISTRIBUTION_OPERATOR') as UserRole;
-      const actor = (req.headers['x-user-id'] as string) || 'staff-user';
+      const { role } = req.auth!;
+      if (role === 'BENEFICIARY' && req.params.id !== req.auth!.sub) {
+        return res.status(403).json({ code: 'ERR_FORBIDDEN', message: 'Beneficiaries may only access their own record' });
+      }
+      const actor = req.auth!.sub;
       const template = req.body.template || 'DISTRIBUTION_RECEIPT';
       const doc = service.autofillTemplate(req.params.id, template, role, actor);
       res.json(doc);
@@ -230,7 +245,7 @@ export function createServer(customDb?: CentralDatabase) {
   });
 
   // 3. Transactions (TRD Section 1 & api-spec.yaml)
-  app.post('/api/v1/transactions', (req, res) => {
+  app.post('/api/v1/transactions', requireRoles('DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR'), (req, res) => {
     const idempotencyKey = req.headers['idempotency-key'] as string;
     if (!idempotencyKey) {
       return res.status(400).json({
@@ -245,7 +260,7 @@ export function createServer(customDb?: CentralDatabase) {
       return res.status(400).json({ code: 'ERR_101', message: 'Missing required transaction fields' });
     }
 
-    const actor = (req.headers['x-user-id'] as string) || 'distribution-operator';
+    const actor = req.auth!.sub;
     const result = service.processOnlineTransaction({
       cardId: card_id,
       lotId: lot_id,
@@ -258,16 +273,16 @@ export function createServer(customDb?: CentralDatabase) {
     res.status(result.status).json(result.body);
   });
 
-  app.get('/api/v1/transactions', (req, res) => {
+  app.get('/api/v1/transactions', requireRoles('RECONCILIATION_OFFICER', 'SUPERVISOR', 'ADMINISTRATOR', 'AUDITOR'), (req, res) => {
     res.json(db.listTransactions());
   });
 
-  app.get('/api/v1/transactions/:id/history', (req, res) => {
+  app.get('/api/v1/transactions/:id/history', requireRoles('RECONCILIATION_OFFICER', 'SUPERVISOR', 'ADMINISTRATOR', 'AUDITOR'), (req: Request<{ id: string }>, res) => {
     res.json(db.getStateHistory(req.params.id));
   });
 
   // 4. Batch Sync (api-spec.yaml, reconciliation.md)
-  app.post('/api/v1/nodes/:id/sync', async (req, res) => {
+  app.post('/api/v1/nodes/:id/sync', requireRoles('SYSTEM_OPERATOR', 'RECONCILIATION_OFFICER', 'ADMINISTRATOR'), async (req: Request<{ id: string }>, res) => {
     try {
       const result = await service.reconcileBatch(req.params.id, req.body as SyncBatchRequest);
       res.status(200).json(result);
@@ -277,7 +292,7 @@ export function createServer(customDb?: CentralDatabase) {
   });
 
   // 5. Edge Node Local Operations
-  app.get('/api/v1/edge-nodes/:id/status', (req, res) => {
+  app.get('/api/v1/edge-nodes/:id/status', requireRoles('DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR', 'SYSTEM_OPERATOR'), (req: Request<{ id: string }>, res) => {
     const edge = edgeNodes.get(req.params.id);
     if (!edge) return res.status(404).json({ message: 'Edge node not found' });
     res.json({
@@ -288,7 +303,7 @@ export function createServer(customDb?: CentralDatabase) {
     });
   });
 
-  app.post('/api/v1/edge-nodes/:id/issue', async (req, res) => {
+  app.post('/api/v1/edge-nodes/:id/issue', requireRoles('DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR'), async (req: Request<{ id: string }>, res) => {
     const edge = edgeNodes.get(req.params.id);
     if (!edge) return res.status(404).json({ message: 'Edge node not found' });
     try {
@@ -299,7 +314,7 @@ export function createServer(customDb?: CentralDatabase) {
         grantId: grant_id || lot_id,
         quantity: Number(quantity),
         idempotencyKey: (req.headers['idempotency-key'] as string) || generateUuidV7(),
-        allowFallback: Boolean(allow_fallback),
+        allowFallback: allow_fallback === true && ['SUPERVISOR', 'ADMINISTRATOR'].includes(req.auth!.role),
       });
 
       // Update central node outbox tracking
@@ -315,7 +330,7 @@ export function createServer(customDb?: CentralDatabase) {
     }
   });
 
-  app.post('/api/v1/edge-nodes/:id/sync-now', async (req, res) => {
+  app.post('/api/v1/edge-nodes/:id/sync-now', requireRoles('SYSTEM_OPERATOR', 'RECONCILIATION_OFFICER', 'ADMINISTRATOR'), async (req: Request<{ id: string }>, res) => {
     const edge = edgeNodes.get(req.params.id);
     if (!edge) return res.status(404).json({ message: 'Edge node not found' });
 
@@ -340,7 +355,7 @@ export function createServer(customDb?: CentralDatabase) {
     }
   });
 
-  app.post('/api/v1/edge-nodes/:id/toggle-online', (req, res) => {
+  app.post('/api/v1/edge-nodes/:id/toggle-online', requireRoles('SYSTEM_OPERATOR', 'ADMINISTRATOR'), (req: Request<{ id: string }>, res) => {
     const edge = edgeNodes.get(req.params.id);
     if (!edge) return res.status(404).json({ message: 'Edge node not found' });
     edge.isOnline = !edge.isOnline;
@@ -355,7 +370,7 @@ export function createServer(customDb?: CentralDatabase) {
   });
 
   // 6. Quotas & Admin (TRD Section 2)
-  app.get('/api/v1/admin/quotas', (req, res) => {
+  app.get('/api/v1/admin/quotas', requireRoles('SUPERVISOR', 'ADMINISTRATOR'), (req, res) => {
     res.json({
       lots: db.listLots(),
       grants: db.listGrants(),
@@ -364,7 +379,7 @@ export function createServer(customDb?: CentralDatabase) {
     });
   });
 
-  app.post('/api/v1/admin/leases', (req, res) => {
+  app.post('/api/v1/admin/leases', requireRoles('SUPERVISOR', 'ADMINISTRATOR'), (req, res) => {
     const { card_id, node_id, quantity } = req.body;
     db.setQuotaLedger({
       id: generateUuidV7(),
@@ -383,15 +398,15 @@ export function createServer(customDb?: CentralDatabase) {
     res.json({ success: true, message: 'Quota lease allocated successfully' });
   });
 
-  app.get('/api/v1/nodes', (req, res) => {
+  app.get('/api/v1/nodes', requireRoles('DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR', 'SYSTEM_OPERATOR', 'AUDITOR'), (req, res) => {
     res.json(db.listNodes());
   });
 
-  app.get('/api/v1/lots', (req, res) => {
+  app.get('/api/v1/lots', requireRoles('DISTRIBUTION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR'), (req, res) => {
     res.json(db.listLots());
   });
 
-  app.post('/api/v1/lots', (req, res) => {
+  app.post('/api/v1/lots', requireRoles('ADMINISTRATOR'), (req, res) => {
     const { name, grain_type, total_quantity } = req.body;
     const lotId = `lot-${Date.now()}`;
     const lot = {
@@ -406,17 +421,17 @@ export function createServer(customDb?: CentralDatabase) {
   });
 
   // 7. Metrics & Analytics (failure-catalog.md)
-  app.get('/api/v1/metrics', (req, res) => {
+  app.get('/api/v1/metrics', requireRoles('ADMINISTRATOR', 'AUDITOR'), (req, res) => {
     res.json(service.getMetrics());
   });
 
   // 8. Immutable Audit Log (PRD 4 & database.md)
-  app.get('/api/v1/audit', (req, res) => {
+  app.get('/api/v1/audit', requireRoles('ADMINISTRATOR', 'AUDITOR'), (req, res) => {
     res.json(db.listAuditEvents());
   });
 
   // 9. Clear Full Database and Reset State (Admin reset)
-  app.post('/api/v1/admin/reset', async (req, res) => {
+  app.post('/api/v1/admin/reset', requireRoles('ADMINISTRATOR'), async (req, res) => {
     try {
       db.clearAllData();
       const nodeDir = path.join(__dirname, '../../data/nodes');
@@ -441,9 +456,13 @@ export function createServer(customDb?: CentralDatabase) {
 
 // If executed directly, run standalone API server
 if (process.argv[1]?.endsWith('server.ts') || process.argv[1]?.endsWith('server.js')) {
-  const PORT = process.env.PORT || 3001;
+  const PORT = Number.parseInt(process.env.PORT || '3001', 10);
   const { app } = createServer();
-  app.listen(PORT, () => {
+  const host = !process.env.AUTH_TOKEN_SECRET && process.env.NODE_ENV !== 'production' ? '127.0.0.1' : undefined;
+  const onListening = () => {
     console.log(`Grain Distribution API running on http://localhost:${PORT}`);
-  });
+    if (host) console.warn('Local demo authentication enabled: administrator access is restricted to localhost.');
+  };
+  if (host) app.listen(PORT, host, onListening);
+  else app.listen(PORT, onListening);
 }
