@@ -1,43 +1,66 @@
 // src/services/central-service.ts
+import crypto from 'node:crypto';
 import { z } from 'zod';
 import type {
   UserRole,
-  RegistrationPayload,
   RegistrationRecord,
   Person,
   HouseholdProfile,
   Card,
-  GrainLot,
-  LotCapGrant,
-  CardQuotaLedger,
   DistributionTransaction,
-  SignedProvisionalToken,
   SyncBatchRequest,
   SyncBatchResponse,
   SyncBatchItemAck,
   FailureEvent,
   AuditEvent,
-  DistributionNode,
   ReasonCode,
 } from '../core/types.js';
 import { generateUuidV7 } from '../core/uuidv7.js';
-import { verifyTokenPayload } from '../core/crypto.js';
+import { verifyTokenPayload, hashCardId } from '../core/crypto.js';
 import { validateTransition, createStateHistoryRecord } from '../core/state-machine.js';
 import { CentralDatabase } from '../database/storage.js';
+import { DomainError } from '../core/errors.js';
+import { isValidQuantity, MAX_QUANTITY_KG } from '../core/limits.js';
+
+const MAX_SYNC_BATCH = 500;
+
+function isRealPastDate(s: string): boolean {
+  const d = new Date(`${s}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) return false; // rejects 9999-99-99, 2023-02-31
+  const now = new Date();
+  return d <= now && now.getUTCFullYear() - d.getUTCFullYear() <= 120;
+}
 
 // Strict Zod schema for registration (PRD 3.1 & TRD Section 3)
 export const RegistrationSchema = z.object({
   first_name: z.string().min(1, 'First name is required').max(50),
   last_name: z.string().min(1, 'Last name is required').max(50),
   phone_number: z.string().regex(/^\+?[0-9]{10,15}$/, 'Valid phone number required (10-15 digits)'),
-  dob: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'DOB must be YYYY-MM-DD'),
+  dob: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'DOB must be YYYY-MM-DD')
+    .refine(isRealPastDate, 'DOB must be a real date in the past'),
   family_count: z.number().int().min(1).max(30),
-  yearly_income: z.number().min(0),
+  yearly_income: z.number().min(0).max(1_000_000_000),
   address: z.string().min(3).max(255),
   city: z.string().min(2).max(100),
   state: z.string().min(2).max(100),
   consent_opt_in: z.boolean().refine((val) => val === true, 'Consent opt-in is required'),
 });
+
+type RegistrationWithActors = RegistrationRecord & { submitted_by?: string; verified_by?: string };
+
+/** Keeps only the last 2 characters: works for 10-digit and 15-digit numbers alike. */
+export function maskPhone(phone: string): string {
+  const visible = 2;
+  if (phone.length <= visible) return '*'.repeat(phone.length);
+  return phone.slice(0, -visible).replace(/\d/g, '*') + phone.slice(-visible);
+}
+
+const normalizePhone = (p: string) => p.replace(/[^\d]/g, '');
+
+const OPERATOR_ROLES = new Set(['DISTRIBUTION_OPERATOR', 'REGISTRATION_OPERATOR']);
+const PRIVILEGED_ROLES = new Set(['SUPERVISOR', 'ADMIN', 'AUDITOR']);
 
 export class CentralService {
   constructor(public readonly db: CentralDatabase) {}
@@ -57,36 +80,53 @@ export class CentralService {
   }
 
   // --- Registration Workflow (PRD 3.1) ---
-  public submitRegistration(payload: unknown, actorId = 'public-user', nodeId?: string): RegistrationRecord {
+  public submitRegistration(payload: unknown, actorId: string, nodeId?: string): RegistrationRecord {
     const parsed = RegistrationSchema.safeParse(payload);
     if (!parsed.success) {
-      throw new Error(`Validation failed: ${parsed.error.issues.map((e) => e.message).join(', ')}`);
+      throw new DomainError(`Validation failed: ${parsed.error.issues.map((e) => e.message).join(', ')}`, 400, 'ERR_101');
+    }
+    if (nodeId && !this.db.getNode(nodeId)) {
+      throw new DomainError('Unknown distribution node', 400, 'ERR_101');
+    }
+
+    // Duplicate guard (heuristic: same phone + DOB). A national-ID check would be stronger.
+    const phone = normalizePhone(parsed.data.phone_number);
+    const duplicate = this.db
+      .listRegistrations()
+      .find((r) => normalizePhone(r.data.phone_number) === phone && r.data.dob === parsed.data.dob);
+    if (duplicate) {
+      throw new DomainError('A registration with this phone number and date of birth already exists', 409, 'ERR_101');
     }
 
     const regId = generateUuidV7();
     const now = new Date().toISOString();
-    const record: RegistrationRecord = {
+    const record: RegistrationWithActors = {
       id: regId,
       status: 'SUBMITTED',
       data: parsed.data,
       node_id: nodeId || this.db.listNodes()[0]?.id,
       created_at: now,
       updated_at: now,
+      submitted_by: actorId,
     };
 
     this.db.insertRegistration(record);
-    this.logAudit(actorId, 'REGISTRATION_SUBMITTED', 'REGISTRATION', regId, { phone: parsed.data.phone_number });
+    this.logAudit(actorId, 'REGISTRATION_SUBMITTED', 'REGISTRATION', regId, { phone: maskPhone(parsed.data.phone_number) });
     return record;
   }
 
   public verifyRegistration(regId: string, actorId: string): RegistrationRecord {
-    const reg = this.db.getRegistration(regId);
-    if (!reg) throw new Error('Registration not found');
+    const reg = this.db.getRegistration(regId) as RegistrationWithActors | undefined;
+    if (!reg) throw new DomainError('Registration not found', 404, 'ERR_404');
     if (reg.status !== 'SUBMITTED') {
-      throw new Error(`Cannot verify registration in status ${reg.status}`);
+      throw new DomainError(`Cannot verify registration in status ${reg.status}`, 409, 'ERR_401');
+    }
+    if (reg.submitted_by && reg.submitted_by === actorId) {
+      throw new DomainError('Separation of duties: you cannot verify a registration you submitted', 403, 'ERR_403');
     }
 
     reg.status = 'VERIFIED';
+    reg.verified_by = actorId;
     reg.updated_at = new Date().toISOString();
     this.db.updateRegistration(reg);
     this.logAudit(actorId, 'REGISTRATION_VERIFIED', 'REGISTRATION', regId, {});
@@ -94,10 +134,14 @@ export class CentralService {
   }
 
   public approveRegistration(regId: string, actorId: string): { registration: RegistrationRecord; person: Person; card: Card } {
-    const reg = this.db.getRegistration(regId);
-    if (!reg) throw new Error('Registration not found');
-    if (reg.status !== 'VERIFIED' && reg.status !== 'SUBMITTED') {
-      throw new Error(`Cannot approve registration in status ${reg.status}`);
+    const reg = this.db.getRegistration(regId) as RegistrationWithActors | undefined;
+    if (!reg) throw new DomainError('Registration not found', 404, 'ERR_404');
+    // FIX: SUBMITTED registrations can no longer be approved directly; verification is mandatory.
+    if (reg.status !== 'VERIFIED') {
+      throw new DomainError(`Registration must be VERIFIED before approval (current: ${reg.status})`, 409, 'ERR_401');
+    }
+    if (reg.submitted_by && reg.submitted_by === actorId) {
+      throw new DomainError('Separation of duties: you cannot approve a registration you submitted', 403, 'ERR_403');
     }
 
     const personId = generateUuidV7(); // UUIDv7 for personal_id (PRD 3.2, ID-001)
@@ -124,57 +168,27 @@ export class CentralService {
 
     this.db.insertPerson(person, household);
 
-    // Issue Card
     const cardId = generateUuidV7();
-    const card: Card = {
-      id: cardId,
-      person_id: personId,
-      status: 'ACTIVE',
-      issued_at: now,
-    };
+    const card: Card = { id: cardId, person_id: personId, status: 'ACTIVE', issued_at: now };
     this.db.insertCard(card);
 
-    // Default monthly quota: 10kg per family member, leased to the registration terminal.
+    // FIX: exactly ONE lease per card (home node). Previously legacy registrations got a lease per node,
+    // multiplying the quota. Use the admin lease endpoint to move a card to another node.
     const allocatedQuota = reg.data.family_count * 10;
-    if (reg.node_id) {
-      this.db.setQuotaLedger({
-        id: generateUuidV7(),
-        card_id: cardId,
-        node_id: reg.node_id,
-        allocated_qty: allocatedQuota,
-        consumed_qty: 0,
-        period_start: now.slice(0, 10),
-      });
-    } else {
-      this.db.setQuotaLedger({
-        id: generateUuidV7(),
-        card_id: cardId,
-        node_id: 'GLOBAL',
-        allocated_qty: allocatedQuota,
-        consumed_qty: 0,
-        period_start: now.slice(0, 10),
-      });
-    }
+    this.db.setQuotaLedger({
+      id: generateUuidV7(),
+      card_id: cardId,
+      node_id: reg.node_id ?? this.db.listNodes()[0]?.id ?? 'GLOBAL',
+      allocated_qty: allocatedQuota,
+      consumed_qty: 0,
+      period_start: now.slice(0, 10),
+    });
 
     reg.status = 'APPROVED';
     reg.person_id = personId;
     reg.card_id = cardId;
     reg.updated_at = now;
     this.db.updateRegistration(reg);
-
-    // Preserve shared leases for legacy registrations that have no terminal assignment.
-    if (!reg.node_id) {
-      for (const node of this.db.listNodes()) {
-        this.db.setQuotaLedger({
-          id: generateUuidV7(),
-          card_id: cardId,
-          node_id: node.id,
-          allocated_qty: allocatedQuota,
-          consumed_qty: 0,
-          period_start: now.slice(0, 10),
-        });
-      }
-    }
 
     this.logAudit(actorId, 'REGISTRATION_APPROVED', 'PERSON', personId, { card_id: cardId, quota: allocatedQuota });
 
@@ -183,36 +197,38 @@ export class CentralService {
 
   // --- Portal & Autofill (PRD 3.3, PORTAL-001 to PORTAL-004) ---
   public lookupPerson(personId: string, callerRole: UserRole, callerId: string): Record<string, unknown> {
-    const person = this.db.getPersonById(personId);
-    if (!person) {
-      throw new Error('Person not found');
+    const role = callerRole as string;
+    // FIX: fail closed. Unknown roles used to fall through to the full-PII branch.
+    if (role !== 'BENEFICIARY' && !OPERATOR_ROLES.has(role) && !PRIVILEGED_ROLES.has(role)) {
+      throw new DomainError('Forbidden', 403, 'ERR_403');
     }
+
+    const person = this.db.getPersonById(personId);
+    if (!person) throw new DomainError('Person not found', 404, 'ERR_404');
 
     const household = this.db.getHouseholdByPersonId(personId);
     const card = this.db.getCardByPersonId(personId);
     const ledger = card ? this.db.getQuotaLedger(card.id) : undefined;
 
-    this.logAudit(callerId, 'PERSON_LOOKUP', 'PERSON', personId, { role: callerRole });
+    this.logAudit(callerId, 'PERSON_LOOKUP', 'PERSON', personId, { role });
 
-    // Strict Field-Level Projections (RBAC)
-    if (callerRole === 'BENEFICIARY') {
+    if (role === 'BENEFICIARY') {
       return {
         id: person.id,
         first_name: person.first_name,
         last_name: person.last_name,
-        masked_phone: person.phone_number.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'),
+        masked_phone: maskPhone(person.phone_number), // FIX: previously a no-op for 10-digit numbers
         card_id: card?.id,
         card_status: card?.status,
         quota_available: ledger ? ledger.allocated_qty - ledger.consumed_qty : 0,
       };
     }
 
-    if (callerRole === 'DISTRIBUTION_OPERATOR' || callerRole === 'REGISTRATION_OPERATOR') {
+    if (OPERATOR_ROLES.has(role)) {
       return {
         id: person.id,
         full_name: `${person.first_name} ${person.last_name}`,
-        phone_number: person.phone_number,
-        dob: person.dob,
+        phone_number: maskPhone(person.phone_number), // least privilege: operators don't need the full number
         family_count: household?.family_count,
         city: household?.city,
         state: household?.state,
@@ -221,7 +237,6 @@ export class CentralService {
         quota_allocated: ledger?.allocated_qty,
         quota_consumed: ledger?.consumed_qty,
         quota_available: ledger ? ledger.allocated_qty - ledger.consumed_qty : 0,
-        // yearly_income is strictly masked for operators
         yearly_income: 'RESTRICTED_ACCESS',
       };
     }
@@ -268,6 +283,10 @@ export class CentralService {
   }
 
   // --- Online Distribution Transaction (TXN-001, Idempotent) ---
+  private rememberRequest(scope: string, fingerprint: string, status: number, response: unknown) {
+    this.db.setIdempotency(scope, status, { fingerprint, response });
+  }
+
   public processOnlineTransaction(params: {
     cardId: string;
     lotId: string;
@@ -276,10 +295,32 @@ export class CentralService {
     idempotencyKey: string;
     actorId: string;
   }): { status: number; body: unknown } {
-    // 1. Check Idempotency Key (TRD Section 3 & Test Plan Scenario 5)
-    const cached = this.db.getIdempotency(params.idempotencyKey);
+    // FIX: reject NaN / Infinity / negative / zero / absurd quantities before touching any ledger.
+    if (!isValidQuantity(params.quantity)) {
+      return { status: 400, body: { code: 'ERR_101', message: `Quantity must be a positive number up to ${MAX_QUANTITY_KG} kg` } };
+    }
+
+    // FIX: idempotency is scoped per caller and bound to the request body.
+    const scope = `txn:${params.actorId}:${params.idempotencyKey}`;
+    const fingerprint = crypto
+      .createHash('sha256')
+      .update(JSON.stringify([params.cardId, params.lotId, params.nodeId, params.quantity]))
+      .digest('hex');
+    const cached = this.db.getIdempotency(scope);
     if (cached) {
-      return { status: cached.status, body: cached.body };
+      const stored = cached.body as { fingerprint?: string; response?: unknown } | undefined;
+      if (stored?.fingerprint !== fingerprint) {
+        return { status: 422, body: { code: 'ERR_101', message: 'Idempotency-Key was already used with a different request' } };
+      }
+      return { status: cached.status, body: stored.response };
+    }
+
+    const card = this.db.listCards().find((c) => c.id === params.cardId);
+    if (!card || card.status !== 'ACTIVE') {
+      return { status: 404, body: { code: 'ERR_404', message: 'Card not found or not active' } };
+    }
+    if (!this.db.getNode(params.nodeId)) {
+      return { status: 400, body: { code: 'ERR_101', message: 'Unknown distribution node' } };
     }
 
     const txnId = generateUuidV7();
@@ -299,7 +340,6 @@ export class CentralService {
 
     this.db.insertStateHistory(createStateHistoryRecord(txnId, 'INITIAL', 'ATTEMPT', params.actorId));
 
-    // Atomic Deduct Quota
     const deduction = this.db.atomicDeductQuota(params.cardId, params.nodeId, params.lotId, params.quantity);
     if (!deduction.success) {
       const reasonCode: ReasonCode = deduction.reason === 'CARD_QUOTA_EXHAUSTED' ? 'ERR_201' : 'ERR_202';
@@ -327,11 +367,10 @@ export class CentralService {
         message: deduction.reason === 'CARD_QUOTA_EXHAUSTED' ? 'Card quota exhausted' : 'Lot cap exhausted',
         transaction: txn,
       };
-      this.db.setIdempotency(params.idempotencyKey, 409, resp);
+      this.rememberRequest(scope, fingerprint, 409, resp);
       return { status: 409, body: resp };
     }
 
-    // Step to PROVISIONAL_ISSUE then RECONCILED
     validateTransition(txn.state, 'PROVISIONAL_ISSUE');
     txn.state = 'PROVISIONAL_ISSUE';
     this.db.insertStateHistory(createStateHistoryRecord(txnId, 'ATTEMPT', 'PROVISIONAL_ISSUE', params.actorId));
@@ -343,20 +382,17 @@ export class CentralService {
     txn.updated_at = new Date().toISOString();
     this.db.insertTransaction(txn);
 
-    const successResp = {
-      success: true,
-      message: 'Transaction processed and reconciled successfully',
-      transaction: txn,
-    };
-    this.db.setIdempotency(params.idempotencyKey, 201, successResp);
+    const successResp = { success: true, message: 'Transaction processed and reconciled successfully', transaction: txn };
+    this.rememberRequest(scope, fingerprint, 201, successResp);
     return { status: 201, body: successResp };
   }
 
   // --- Batch Sync & Reconciliation (reconciliation.md, api-spec.yaml) ---
   public async reconcileBatch(nodeId: string, batch: SyncBatchRequest): Promise<SyncBatchResponse> {
     const node = this.db.getNode(nodeId);
-    if (!node) {
-      throw new Error(`Node ${nodeId} not registered`);
+    if (!node) throw new DomainError('Node not registered', 404, 'ERR_404');
+    if (!Array.isArray(batch?.tokens) || batch.tokens.length > MAX_SYNC_BATCH) {
+      throw new DomainError(`Batch must contain at most ${MAX_SYNC_BATCH} tokens`, 400, 'ERR_101');
     }
 
     const items: SyncBatchItemAck[] = [];
@@ -364,11 +400,70 @@ export class CentralService {
     let rejected = 0;
     let duplicate = 0;
     let conflict = 0;
-    let manualReview = 0;
+    const manualReview = 0;
+
+    // Resolve cards from the signed `sub` (hash of the full card id). `qid` only holds a truncated prefix.
+    let cardBySub: Map<string, string> | undefined;
+    const resolveCard = (sub: string): string | undefined => {
+      cardBySub ??= new Map(this.db.listCards().map((c) => [hashCardId(c.id), c.id] as const));
+      return cardBySub.get(sub);
+    };
+
+    const reject = (token: SyncBatchRequest['tokens'][number], code: ReasonCode, message: string, type: 'CRYPTO_FAILURE' | 'TXN_FAILURE', metadata: Record<string, unknown> = {}) => {
+      rejected += 1;
+      this.db.insertFailureEvent({
+        event_id: generateUuidV7(),
+        txn_id: token.payload.tid,
+        type,
+        code,
+        node_id: nodeId,
+        timestamp: new Date().toISOString(),
+        retryable: false,
+        metadata,
+      });
+      items.push({ token_id: token.id, txn_id: token.txn_id, outcome: 'REJECTED', reason_code: code, message });
+    };
+
+    const conflictWith = (token: SyncBatchRequest['tokens'][number], code: ReasonCode, message: string, metadata: Record<string, unknown> = {}) => {
+      conflict += 1;
+      this.db.insertFailureEvent({
+        event_id: generateUuidV7(),
+        txn_id: token.payload.tid,
+        type: 'TXN_FAILURE',
+        code,
+        node_id: nodeId,
+        timestamp: new Date().toISOString(),
+        retryable: false,
+        metadata,
+      });
+      items.push({ token_id: token.id, txn_id: token.txn_id, outcome: 'CONFLICT', reason_code: code, message });
+    };
 
     for (const token of batch.tokens) {
-      // 1. Check Duplicate Nonce or Existing Transaction (Test Plan 11)
-      if (this.db.isNonceUsed(token.nonce) || this.db.getTransaction(token.txn_id)?.state === 'RECONCILED') {
+      const p = token.payload;
+
+      // 1. FIX (replay): every unsigned envelope field must equal its signed counterpart, and the token
+      //    must belong to the node that is syncing. Dedup below uses ONLY signed values.
+      if (
+        token.txn_id !== p.tid || token.nonce !== p.n || token.counter !== p.c ||
+        token.key_id !== p.kid || p.nid !== nodeId || p.v !== 1 || p.unit !== 'kg' ||
+        !isValidQuantity(p.qty)
+      ) {
+        reject(token, 'ERR_301', 'Token envelope does not match signed payload', 'CRYPTO_FAILURE', { reason: 'envelope mismatch' });
+        continue;
+      }
+
+      // 2. Cryptographic Signature Verification (Ed25519), before any state lookups
+      const isSigValid = await verifyTokenPayload(p, token.signature, node.public_key);
+      if (!isSigValid) {
+        reject(token, 'ERR_301', 'Invalid cryptographic signature', 'CRYPTO_FAILURE', { reason: 'Ed25519 signature mismatch or forged payload' });
+        continue;
+      }
+
+      // ---- No `await` below this line: the check-and-commit sequence is atomic within the process ----
+
+      // 3. Duplicate / replay check on SIGNED nonce + txn id
+      if (this.db.isNonceUsed(p.n) || this.db.getTransaction(p.tid)?.state === 'RECONCILED') {
         duplicate += 1;
         items.push({
           token_id: token.id,
@@ -379,98 +474,57 @@ export class CentralService {
         continue;
       }
 
-      // 2. Cryptographic Signature Verification (Ed25519) (Test Plan 4)
-      const isSigValid = await verifyTokenPayload(token.payload, token.signature, node.public_key);
-      if (!isSigValid) {
-        rejected += 1;
-        const code: ReasonCode = 'ERR_301';
-        this.db.insertFailureEvent({
-          event_id: generateUuidV7(),
-          txn_id: token.txn_id,
-          type: 'CRYPTO_FAILURE',
-          code,
-          node_id: nodeId,
-          timestamp: new Date().toISOString(),
-          retryable: false,
-          metadata: { reason: 'Ed25519 signature mismatch or forged payload' },
-        });
-        items.push({
-          token_id: token.id,
-          txn_id: token.txn_id,
-          outcome: 'REJECTED',
-          reason_code: code,
-          message: 'Invalid cryptographic signature',
-        });
-        continue;
-      }
-
-      // 3. Expiry Check (Test Plan 19)
+      // 4. Expiry Check (Test Plan 19)
       const nowSec = Math.floor(Date.now() / 1000);
-      if (token.payload.exp < nowSec) {
-        rejected += 1;
-        const code: ReasonCode = 'ERR_402';
-        this.db.insertFailureEvent({
-          event_id: generateUuidV7(),
-          txn_id: token.txn_id,
-          type: 'TXN_FAILURE',
-          code,
-          node_id: nodeId,
-          timestamp: new Date().toISOString(),
-          retryable: false,
-          metadata: { exp: token.payload.exp, now: nowSec },
-        });
-        items.push({
-          token_id: token.id,
-          txn_id: token.txn_id,
-          outcome: 'REJECTED',
-          reason_code: code,
-          message: 'Provisional token expired prior to reconciliation',
+      if (p.exp < nowSec) {
+        reject(token, 'ERR_402', 'Provisional token expired prior to reconciliation', 'TXN_FAILURE', { exp: p.exp, now: nowSec });
+        continue;
+      }
+
+      // 5. Lot, card and existing-transaction checks
+      if (!this.db.getLot(p.lid)) {
+        conflictWith(token, 'ERR_401', 'Lot referenced by token does not exist in central ledger');
+        continue;
+      }
+      const cardId = resolveCard(p.sub);
+      if (!cardId) {
+        conflictWith(token, 'ERR_401', 'Card referenced by token does not exist in central ledger');
+        continue;
+      }
+      if (this.db.getTransaction(p.tid)) {
+        conflictWith(token, 'ERR_401', 'Transaction id already exists in a non-reconciled state');
+        continue;
+      }
+
+      // 6. FIX (accounting): charge the central card ledger and lot. Previously offline issuance was never
+      //    deducted, so central quotas could be exceeded indefinitely.
+      const deduction = this.db.atomicDeductQuota(cardId, nodeId, p.lid, p.qty);
+      if (!deduction.success) {
+        const code: ReasonCode = deduction.reason === 'CARD_QUOTA_EXHAUSTED' ? 'ERR_201' : 'ERR_202';
+        conflictWith(token, code, 'Offline issuance exceeds the central quota/lot ledger. Flagged for review', {
+          requested_quantity: p.qty,
+          reason: deduction.reason,
         });
         continue;
       }
 
-      // 4. Quota Lease & Counter Verification
-      // Central checks if card quota and lot exists
-      const lot = this.db.getLot(token.payload.lid);
-      if (!lot) {
-        conflict += 1;
-        items.push({
-          token_id: token.id,
-          txn_id: token.txn_id,
-          outcome: 'CONFLICT',
-          reason_code: 'ERR_401',
-          message: 'Lot referenced by token does not exist in central ledger',
-        });
-        continue;
-      }
-
-      // Record transaction into central MySQL / DB as RECONCILED
       const nowIso = new Date().toISOString();
-      const existingTxn = this.db.getTransaction(token.txn_id);
-      if (!existingTxn) {
-        const txn: DistributionTransaction = {
-          id: token.txn_id,
-          card_id: token.payload.qid.replace('quota_', ''),
-          node_id: nodeId,
-          lot_id: token.payload.lid,
-          quantity: token.payload.qty,
-          state: 'RECONCILED',
-          idempotency_key: token.payload.n,
-          created_at: nowIso,
-          updated_at: nowIso,
-        };
-        this.db.insertTransaction(txn);
-        this.db.insertStateHistory(createStateHistoryRecord(token.txn_id, 'PROVISIONAL_ISSUE', 'RECONCILED', `node:${nodeId}`));
-      } else {
-        existingTxn.state = 'RECONCILED';
-        existingTxn.updated_at = nowIso;
-        this.db.updateTransaction(existingTxn);
-        this.db.insertStateHistory(createStateHistoryRecord(token.txn_id, 'PROVISIONAL_ISSUE', 'RECONCILED', `node:${nodeId}`));
-      }
+      const txn: DistributionTransaction = {
+        id: p.tid,
+        card_id: cardId, // full card id (was a truncated 8-char prefix)
+        node_id: nodeId,
+        lot_id: p.lid,
+        quantity: p.qty,
+        state: 'RECONCILED',
+        idempotency_key: p.n,
+        created_at: nowIso,
+        updated_at: nowIso,
+      };
+      this.db.insertTransaction(txn);
+      this.db.insertStateHistory(createStateHistoryRecord(p.tid, 'PROVISIONAL_ISSUE', 'RECONCILED', `node:${nodeId}`));
 
-      // Mark token, nonce used
       this.db.insertProvisionalToken(token);
-      this.db.markNonceUsed(token.nonce, token.id);
+      this.db.markNonceUsed(p.n, token.id);
 
       accepted += 1;
       items.push({
@@ -481,7 +535,6 @@ export class CentralService {
       });
     }
 
-    // Update node health and outbox depth
     node.last_heartbeat = new Date().toISOString();
     node.status = 'ONLINE';
     node.outbox_depth = Math.max(0, node.outbox_depth - (accepted + duplicate));
@@ -549,10 +602,7 @@ export class CentralService {
       fallbackCount,
       fallbackRate,
       syncBacklog,
-      alertStatus: {
-        invalidSigAlert,
-        backlogAlert,
-      },
+      alertStatus: { invalidSigAlert, backlogAlert },
       failureBreakdown: breakdown,
     };
   }
