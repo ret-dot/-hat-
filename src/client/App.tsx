@@ -27,7 +27,6 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { TxnState, ReasonCode } from '../core/types.js';
-import { supabaseClient } from './supabase.js';
 
 interface CardBeneficiary {
   id: string;
@@ -188,10 +187,6 @@ export default function App(): React.ReactElement {
   >('distribution');
   const [accessToken, setAccessToken] = useState('');
   const [authStatus, setAuthStatus] = useState<'disconnected' | 'connected' | 'unavailable'>('disconnected');
-  const [supabaseEmail, setSupabaseEmail] = useState('');
-  const [supabasePassword, setSupabasePassword] = useState('');
-  const [authMessage, setAuthMessage] = useState('');
-  const [authLoading, setAuthLoading] = useState(false);
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [selectedNodeId, setSelectedNodeId] = useState<string>('node-alpha-001');
   const selectedNodeIdRef = useRef(selectedNodeId);
@@ -245,13 +240,7 @@ export default function App(): React.ReactElement {
   const apiFetch = (input: RequestInfo | URL, init: RequestInit = {}, token = accessToken) => {
     const headers = new Headers(init.headers);
     if (token) headers.set('Authorization', `Bearer ${token}`);
-    return fetch(input, { ...init, headers }).then(async (response) => {
-      if (response.status === 401 || response.status === 403) {
-        const body = await response.clone().json().catch(() => null);
-        setAuthMessage(body?.message || 'Authentication or authorization failed');
-      }
-      return response;
-    });
+    return fetch(input, { ...init, headers });
   };
 
   const loadAllData = async (
@@ -312,67 +301,6 @@ export default function App(): React.ReactElement {
     const interval = setInterval(() => loadAllData(undefined, selectedNodeId), 5000);
     return () => clearInterval(interval);
   }, [selectedNodeId, accessToken]);
-
-  useEffect(() => {
-    if (!supabaseClient) return;
-
-    let active = true;
-    void supabaseClient.auth.getSession().then(({ data, error }) => {
-      if (error) {
-        setAuthMessage(error.message);
-        return;
-      }
-      if (active && data.session) {
-        setAccessToken(data.session.access_token);
-        setAuthStatus('connected');
-      }
-    });
-
-    const { data: { subscription } } = supabaseClient.auth.onAuthStateChange((_event, session) => {
-      if (!active) return;
-      setAccessToken(session?.access_token || '');
-      setAuthStatus(session ? 'connected' : 'disconnected');
-      setAuthMessage('');
-      if (!session) {
-        setCards([]);
-        setSelectedCardId('');
-        setLots([]);
-        setNodes([]);
-        setRegistrations([]);
-        setAuditLogs([]);
-        setMetrics(null);
-      }
-    });
-
-    return () => {
-      active = false;
-      subscription.unsubscribe();
-    };
-  }, []);
-
-  const handleSupabaseLogin = async () => {
-    if (!supabaseClient) return;
-    setAuthLoading(true);
-    setAuthMessage('');
-    try {
-      const { error } = await supabaseClient.auth.signInWithPassword({
-        email: supabaseEmail,
-        password: supabasePassword,
-      });
-      if (error) setAuthMessage(error.message);
-      setSupabasePassword('');
-    } catch (error) {
-      setAuthMessage(error instanceof Error ? error.message : 'Supabase sign-in failed');
-    } finally {
-      setAuthLoading(false);
-    }
-  };
-
-  const handleSupabaseLogout = async () => {
-    if (!supabaseClient) return;
-    const { error } = await supabaseClient.auth.signOut();
-    if (error) setAuthMessage(error.message);
-  };
 
   const connectLocalDemo = async () => {
     try {
@@ -697,37 +625,7 @@ export default function App(): React.ReactElement {
           </button>
 
           <div className="role-selector" style={{ gap: '0.4rem' }}>
-            {supabaseClient ? (
-              authStatus === 'connected' ? (
-                <button type="button" className="btn-secondary" onClick={handleSupabaseLogout}>
-                  Sign Out
-                </button>
-              ) : (
-                <>
-                  <input
-                    type="email"
-                    autoComplete="username"
-                    aria-label="Supabase account email"
-                    placeholder="Email"
-                    value={supabaseEmail}
-                    onChange={(e) => setSupabaseEmail(e.target.value)}
-                    style={{ width: '150px', padding: '0.35rem', background: '#090d16', color: '#fff', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}
-                  />
-                  <input
-                    type="password"
-                    autoComplete="current-password"
-                    aria-label="Supabase account password"
-                    placeholder="Password"
-                    value={supabasePassword}
-                    onChange={(e) => setSupabasePassword(e.target.value)}
-                    style={{ width: '130px', padding: '0.35rem', background: '#090d16', color: '#fff', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}
-                  />
-                  <button type="button" className="btn-secondary" onClick={handleSupabaseLogin} disabled={authLoading}>
-                    {authLoading ? 'Signing In…' : 'Sign In'}
-                  </button>
-                </>
-              )
-            ) : import.meta.env.DEV ? (
+            {import.meta.env.DEV ? (
               <button
                 type="button"
                 className="btn-secondary"
@@ -739,12 +637,12 @@ export default function App(): React.ReactElement {
               </button>
             ) : (
               <span role="status" style={{ color: 'var(--rose-400)', fontSize: '0.7rem' }}>
-                Configure Supabase frontend environment variables
+                Local demo login is only available during local development
               </span>
             )}
-            {(authMessage || authStatus === 'unavailable') && (
+            {authStatus === 'unavailable' && (
               <span role="status" style={{ color: 'var(--rose-400)', fontSize: '0.7rem' }}>
-                {authMessage || 'Demo login unavailable'}
+                Demo login unavailable
               </span>
             )}
           </div>

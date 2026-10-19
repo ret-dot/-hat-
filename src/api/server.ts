@@ -11,8 +11,7 @@ import { EdgeDistributionNode } from '../edge-node/edge-node.js';
 import { generateNodeKeyPair } from '../core/crypto.js';
 import { generateUuidV7 } from '../core/uuidv7.js';
 import type { SyncBatchRequest } from '../core/types.js';
-import { createAuthMiddleware, createLocalDemoLogin, createSupabaseAuthMiddleware, requireRoles } from './auth.js';
-import { SupabaseStateConflictError, SupabaseStateStore } from '../database/supabase-state.js';
+import { createAuthMiddleware, createLocalDemoLogin, requireRoles } from './auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,27 +20,15 @@ export function createServer(customDb?: CentralDatabase, authSecret = process.en
   const app = express();
   app.use(cors());
   app.use(express.json());
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLISHABLE_KEY;
-  const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const hasSupabaseConfiguration = Boolean(supabaseUrl || supabaseAnonKey || supabaseServiceRoleKey);
-  if (hasSupabaseConfiguration && (!supabaseUrl || !supabaseAnonKey || !supabaseServiceRoleKey)) {
-    throw new Error('Supabase backend requires SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY');
-  }
-  const stateStore = supabaseUrl && supabaseServiceRoleKey
-    ? new SupabaseStateStore(supabaseUrl, supabaseServiceRoleKey)
-    : undefined;
-  const localDemoAuth = !hasSupabaseConfiguration && !authSecret && process.env.NODE_ENV !== 'production';
+  const localDemoAuth = !authSecret && process.env.NODE_ENV !== 'production';
   const effectiveAuthSecret = authSecret || (localDemoAuth ? randomBytes(32).toString('base64url') : undefined);
 
   const dbPath = path.join(__dirname, '../../data/central_db.json');
-  const db = customDb || new CentralDatabase(stateStore ? undefined : dbPath);
+  const db = customDb || new CentralDatabase(dbPath);
   const service = new CentralService(db);
 
   // In-memory registry of EdgeNode instances for interactive demo
   const edgeNodes = new Map<string, EdgeDistributionNode>();
-  let stateRequestQueue = Promise.resolve();
-
   // Ensure default seed data exists
   async function seedDefaults() {
     if (db.listNodes().length === 0) {
@@ -142,11 +129,9 @@ export function createServer(customDb?: CentralDatabase, authSecret = process.en
     }
   }
 
-  if (!stateStore) {
-    seedDefaults().catch((error: unknown) => {
-      console.error('Unable to seed local demo data:', error);
-    });
-  }
+  seedDefaults().catch((error: unknown) => {
+    console.error('Unable to seed local demo data:', error);
+  });
 
   // --- API Routes ---
 
@@ -159,68 +144,12 @@ export function createServer(customDb?: CentralDatabase, authSecret = process.en
     res.json({ status: 'UP', message: 'API server running. Start the website with npm run dev.' });
   });
 
-  const supabaseStateMiddleware: RequestHandler | undefined = stateStore
-    ? async (_req, res, next) => {
-        let releaseRequest!: () => void;
-        const previousRequest = stateRequestQueue;
-        stateRequestQueue = new Promise<void>((resolve) => {
-          releaseRequest = resolve;
-        });
-        await previousRequest;
-        let released = false;
-        const release = () => {
-          if (released) return;
-          released = true;
-          releaseRequest();
-        };
-        res.once('finish', release);
-        res.once('close', release);
-
-        try {
-          const snapshot = await stateStore.load();
-          db.restoreSnapshot(snapshot.state);
-          const originalState = JSON.stringify(snapshot.state);
-          if (db.listNodes().length === 0) await seedDefaults();
-
-          const sendJson = res.json.bind(res);
-          res.json = ((body: unknown) => {
-            const updatedState = db.createSnapshot();
-            if (JSON.stringify(updatedState) === originalState) return sendJson(body);
-
-            void stateStore.save(updatedState, snapshot.revision)
-              .then(() => sendJson(body))
-              .catch((error: unknown) => {
-                console.error('Supabase state commit failed:', error);
-                if (!res.headersSent) {
-                  const conflict = error instanceof SupabaseStateConflictError;
-                  res.status(conflict ? 409 : 503);
-                  sendJson({
-                    code: conflict ? 'ERR_STATE_CONFLICT' : 'ERR_STORAGE_UNAVAILABLE',
-                    message: conflict
-                      ? 'Data changed while processing this request; please retry'
-                      : 'Persistent storage is temporarily unavailable',
-                  });
-                }
-              });
-            return res;
-          }) as typeof res.json;
-          return next();
-        } catch (error) {
-          console.error('Supabase state load failed:', error);
-          return res.status(503).json({
-            code: 'ERR_STORAGE_UNAVAILABLE',
-            message: 'Persistent storage is unavailable; verify the Supabase migration and server credentials',
-          });
-        }
-      }
-    : undefined;
-
   if (localDemoAuth && effectiveAuthSecret) {
     app.post('/api/v1/auth/demo', createLocalDemoLogin(effectiveAuthSecret));
   }
 
   // 1. Registrations (PRD 3.1 & TRD Section 2)
-  app.post('/api/v1/registrations', ...(supabaseStateMiddleware ? [supabaseStateMiddleware] : []), (req, res) => {
+  app.post('/api/v1/registrations', (req, res) => {
     try {
       const record = service.submitRegistration(req.body, 'public-registration');
       res.status(201).json({ id: record.id, status: record.status, created_at: record.created_at });
@@ -229,10 +158,7 @@ export function createServer(customDb?: CentralDatabase, authSecret = process.en
     }
   });
 
-  app.use('/api/v1', stateStore && supabaseUrl && supabaseAnonKey
-    ? createSupabaseAuthMiddleware(supabaseUrl, supabaseAnonKey)
-    : createAuthMiddleware(effectiveAuthSecret));
-  if (supabaseStateMiddleware) app.use('/api/v1', supabaseStateMiddleware);
+  app.use('/api/v1', createAuthMiddleware(effectiveAuthSecret));
 
   app.get('/api/v1/registrations', requireRoles('REGISTRATION_OPERATOR', 'SUPERVISOR', 'ADMINISTRATOR', 'AUDITOR'), (req, res) => {
     res.json(db.listRegistrations());
@@ -533,13 +459,7 @@ export function createServer(customDb?: CentralDatabase, authSecret = process.en
 if (process.argv[1]?.endsWith('server.ts') || process.argv[1]?.endsWith('server.js')) {
   const PORT = Number.parseInt(process.env.PORT || '3001', 10);
   const { app } = createServer();
-  const supabaseConfigured = Boolean(
-    process.env.SUPABASE_URL ||
-    process.env.SUPABASE_ANON_KEY ||
-    process.env.SUPABASE_PUBLISHABLE_KEY ||
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-  const localDemoAuth = !supabaseConfigured && !process.env.AUTH_TOKEN_SECRET && process.env.NODE_ENV !== 'production';
+  const localDemoAuth = !process.env.AUTH_TOKEN_SECRET && process.env.NODE_ENV !== 'production';
   const host = localDemoAuth ? '127.0.0.1' : undefined;
   const onListening = () => {
     console.log(`Grain Distribution API running on http://localhost:${PORT}`);
