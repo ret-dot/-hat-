@@ -4,3 +4,4 @@ test_data/
 garbage/
 /data/central_db.json
 /data/nodes/
+/data/keys/
